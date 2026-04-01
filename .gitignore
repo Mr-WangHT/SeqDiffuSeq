@@ -32,6 +32,9 @@ checkpoints/
 *.pth
 *.pt
 *.hdf5
+*.txt
+*.png
+*.pkl
 
 # Ignore logs and temporary files
 *.log

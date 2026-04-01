@@ -133,6 +133,36 @@ def _metrics_from_margin(m: torch.Tensor, y: torch.Tensor, tau: float) -> Dict[s
     }
 
 
+def calc_binary_roc_auc(scores: torch.Tensor, labels: torch.Tensor) -> float:
+    if scores.numel() == 0 or labels.numel() == 0:
+        return 0.5
+    y = labels.long()
+    pos_cnt = int((y == 1).sum().item())
+    neg_cnt = int((y == 0).sum().item())
+    if pos_cnt == 0 or neg_cnt == 0:
+        return 0.5
+
+    # Rank-based AUC (equivalent to Mann-Whitney U) with tie handling.
+    sorted_idx = torch.argsort(scores)
+    sorted_scores = scores[sorted_idx]
+    sorted_labels = y[sorted_idx]
+
+    n = int(sorted_scores.numel())
+    ranks = torch.empty(n, dtype=torch.float32)
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and float(sorted_scores[j].item()) == float(sorted_scores[i].item()):
+            j += 1
+        avg_rank = 0.5 * ((i + 1) + j)
+        ranks[i:j] = avg_rank
+        i = j
+
+    sum_pos_ranks = float(ranks[sorted_labels == 1].sum().item())
+    auc = (sum_pos_ranks - pos_cnt * (pos_cnt + 1) / 2.0) / (pos_cnt * neg_cnt)
+    return float(max(0.0, min(1.0, auc)))
+
+
 def select_tau_by_f1(m: torch.Tensor, y: torch.Tensor, candidate_count: int = 61) -> float:
     if m.numel() == 0:
         return 0.0
@@ -273,6 +303,7 @@ def evaluate(
     if tau_mode == "auto":
         tau_used = select_tau_by_f1(m_all, y_all, candidate_count=tau_candidates)
     cls_metrics = _metrics_from_margin(m_all, y_all, tau_used)
+    auc = calc_binary_roc_auc(m_all, y_all)
 
     m0 = sum(margins_y0) / max(1, len(margins_y0))
     m1 = sum(margins_y1) / max(1, len(margins_y1))
@@ -305,6 +336,7 @@ def evaluate(
         "recall": cls_metrics["recall"],
         "f1": cls_metrics["f1"],
         "acc": cls_metrics["acc"],
+        "auc": auc,
         "pred_pos_rate": cls_metrics["pred_pos_rate"],
         "margin_y0_mean": m0,
         "margin_y1_mean": m1,
@@ -324,7 +356,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exp-name", required=True)
 
     p.add_argument("--batch-size", type=int, default=8)
-    p.add_argument("--num-epochs", type=int, default=40)
+    p.add_argument("--num-epochs", type=int, default=500)
+    p.add_argument("--eval-every", type=int, default=10)
+    p.add_argument("--save-every", type=int, default=10)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--weight-decay", type=float, default=0.0)
@@ -396,7 +430,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dynamic-ema-momentum", type=float, default=0.9)
 
     p.add_argument("--seed", type=int, default=0)
-    p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
+    p.add_argument("--device", default="cuda:0" if torch.cuda.is_available() else "cpu")
     p.add_argument("--save-all-checkpoints", action="store_true")
     p.add_argument("--no-save-all-checkpoints", action="store_false", dest="save_all_checkpoints")
     p.set_defaults(save_all_checkpoints=True)
@@ -478,8 +512,12 @@ def main() -> None:
 
     records: List[Dict[str, float]] = []
     best_f1 = -1.0
+    best_auc = -1.0
     best_primary = -1.0
     best_tau = float(args.tau)
+
+    eval_every = max(1, int(args.eval_every))
+    save_every = max(1, int(args.save_every))
 
     metric_name = str(args.best_model_metric)
     metric_alpha = float(max(0.0, min(1.0, args.best_model_alpha)))
@@ -633,16 +671,25 @@ def main() -> None:
             tr_aux_scale = s_aux_scale / max(1, steps)
             tr_aux_ratio = s_aux_ratio / max(1, steps)
 
+            if epoch % eval_every != 0:
+                log(
+                    f"epoch={epoch} train_loss={tr_loss:.6f} train_mse={tr_mse:.6f} train_consistency={tr_cons:.6f} "
+                    f"train_proto={tr_proto:.6f} train_rank={tr_rank:.6f} train_hn={tr_hn:.6f} train_pos={tr_pos:.6f} "
+                    f"train_aux_scale={tr_aux_scale:.6f} train_aux_ratio={tr_aux_ratio:.6f} [skip_valid]"
+                )
+                continue
+
             log(
                 f"epoch={epoch} train_loss={tr_loss:.6f} train_mse={tr_mse:.6f} train_consistency={tr_cons:.6f} train_proto={tr_proto:.6f} "
                 f"train_rank={tr_rank:.6f} train_hn={tr_hn:.6f} train_pos={tr_pos:.6f} "
                 f"train_aux_scale={tr_aux_scale:.6f} train_aux_ratio={tr_aux_ratio:.6f} "
-                f"valid_loss={val['loss']:.6f} valid_f1={val['f1']:.6f} valid_p={val['precision']:.6f} valid_r={val['recall']:.6f} "
+                f"valid_loss={val['loss']:.6f} valid_f1={val['f1']:.6f} valid_auc={val['auc']:.6f} "
+                f"valid_p={val['precision']:.6f} valid_r={val['recall']:.6f} "
                 f"valid_pred_pos={val['pred_pos_rate']:.6f} margin_gap={val['margin_gap']:.6f} "
                 f"recall20={val['recall20']:.6f} effort20={val['effort20']:.6f} rank_score={val['rank_score']:.6f} tau_used={val['tau']:.6f}"
             )
 
-            if args.save_all_checkpoints:
+            if args.save_all_checkpoints and (epoch % save_every == 0):
                 torch.save(
                     {
                         "epoch": epoch,
@@ -669,6 +716,7 @@ def main() -> None:
                     "valid_precision": val["precision"],
                     "valid_recall": val["recall"],
                     "valid_f1": val["f1"],
+                    "valid_auc": val["auc"],
                     "valid_pred_pos_rate": val["pred_pos_rate"],
                     "valid_margin_y0_mean": val["margin_y0_mean"],
                     "valid_margin_y1_mean": val["margin_y1_mean"],
@@ -710,6 +758,19 @@ def main() -> None:
                     model_dir / "checkpoint_best_f1.pth",
                 )
                 log(f"[best_f1] epoch={epoch} valid_f1={best_f1:.6f} tau={float(val['tau']):.6f}")
+
+            if val["auc"] > best_auc:
+                best_auc = float(val["auc"])
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "best_tau": float(val["tau"]),
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optim.state_dict(),
+                    },
+                    model_dir / "checkpoint_best_auc.pth",
+                )
+                log(f"[best_auc] epoch={epoch} valid_auc={best_auc:.6f} tau={float(val['tau']):.6f}")
 
         (model_dir / "selected_tau.txt").write_text(f"{best_tau:.8f}\n", encoding="utf-8")
         log(f"[done] best_tau={best_tau:.6f}")

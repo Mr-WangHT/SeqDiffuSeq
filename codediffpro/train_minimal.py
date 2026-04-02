@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 from tokenizers import Tokenizer
+from tokenizers import decoders, models, normalizers, pre_tokenizers
 from torch.utils.data import ConcatDataset, DataLoader, WeightedRandomSampler
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -25,6 +26,19 @@ try:
 except ModuleNotFoundError:
     from dataloader_utils import FileSequenceDataset
 from codediffpro.modeling import CodeSeqDiffuProtoModel, LabelGaussianDiffusion
+
+
+def load_tokenizer(tokenizer_path: Path) -> Tokenizer:
+    try:
+        return Tokenizer.from_file(str(tokenizer_path))
+    except Exception:
+        vocab_path = tokenizer_path.with_name("vocab.json")
+        merges_path = tokenizer_path.with_name("merges.txt")
+        tokenizer = Tokenizer(models.BPE.from_file(str(vocab_path), str(merges_path), unk_token="<unk>"))
+        tokenizer.normalizer = normalizers.Sequence([normalizers.NFKC()])
+        tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+        tokenizer.decoder = decoders.BPEDecoder(suffix="</w>")
+        return tokenizer
 
 ALL_TRAIN_RELEASES = {
     "activemq": "activemq-5.0.0",
@@ -434,6 +448,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--save-all-checkpoints", action="store_true")
     p.add_argument("--no-save-all-checkpoints", action="store_false", dest="save_all_checkpoints")
     p.set_defaults(save_all_checkpoints=True)
+    p.add_argument(
+        "--resume-checkpoint",
+        default="",
+        help="Path to a checkpoint file to resume from. If relative, it is resolved under model-dir.",
+    )
     return p.parse_args()
 
 
@@ -441,7 +460,7 @@ def main() -> None:
     args = parse_args()
     torch.manual_seed(args.seed)
 
-    tokenizer = Tokenizer.from_file(args.tokenizer_json)
+    tokenizer = load_tokenizer(Path(args.tokenizer_json))
     train_release, val_release, test_releases = get_project_releases(args.dataset)
     data_dir = Path(args.data_dir)
 
@@ -515,6 +534,7 @@ def main() -> None:
     best_auc = -1.0
     best_primary = -1.0
     best_tau = float(args.tau)
+    start_epoch = 0
 
     eval_every = max(1, int(args.eval_every))
     save_every = max(1, int(args.save_every))
@@ -558,6 +578,22 @@ def main() -> None:
         eff_pos_weight = float(args.positive_margin_weight) * 1.5
         eff_rank_hard_mix = max(0.0, min(1.0, 0.7 * float(args.ranking_hard_mix)))
 
+    resume_msg = "[resume] none"
+    if args.resume_checkpoint:
+        resume_path = Path(args.resume_checkpoint)
+        if not resume_path.is_absolute():
+            resume_path = model_dir / resume_path
+        ckpt = torch.load(resume_path, map_location="cpu")
+        model.load_state_dict(ckpt["model_state_dict"], strict=False)
+        if "optimizer_state_dict" in ckpt:
+            try:
+                optim.load_state_dict(ckpt["optimizer_state_dict"])
+            except ValueError:
+                pass
+        start_epoch = int(ckpt.get("epoch", 0))
+        best_tau = float(ckpt.get("best_tau", best_tau))
+        resume_msg = f"[resume] checkpoint={resume_path} start_epoch={start_epoch} best_tau={best_tau:.6f}"
+
     with log_path.open("w", encoding="utf-8") as logf:
         def log(msg: str) -> None:
             print(msg)
@@ -573,10 +609,31 @@ def main() -> None:
             f"dynamic_aux_balance={args.dynamic_aux_balance} target_aux_ratio={args.dynamic_target_aux_ratio} "
             f"scale_range=[{args.dynamic_scale_min},{args.dynamic_scale_max}] ema={args.dynamic_ema_momentum}"
         )
+        log(resume_msg)
 
         ema_aux_scale = 1.0
 
-        for epoch in range(1, args.num_epochs + 1):
+        if start_epoch > 0:
+            model.eval()
+            val = evaluate(
+                model=model,
+                diffusion=diffusion,
+                loader=val_loader,
+                device=device,
+                proto_temperature=args.proto_temperature,
+                tau=args.tau,
+                tau_mode=args.tau_mode,
+                tau_candidates=args.tau_candidates,
+            )
+            best_f1 = float(val["f1"])
+            best_primary = _primary_metric(val)
+            best_tau = float(val["tau"])
+            log(
+                f"[resume_eval] epoch={start_epoch} metric={metric_name} score={best_primary:.6f} "
+                f"valid_f1={best_f1:.6f} tau={best_tau:.6f}"
+            )
+
+        for epoch in range(start_epoch + 1, args.num_epochs + 1):
             model.train()
             s_loss = s_mse = s_cons = s_proto = s_rank = s_hn = s_pos = s_aux_scale = s_aux_ratio = 0.0
             steps = 0

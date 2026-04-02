@@ -9,6 +9,7 @@ from typing import Dict, Tuple
 
 import torch
 from tokenizers import Tokenizer
+from tokenizers import decoders, models, normalizers, pre_tokenizers
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -16,6 +17,19 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from codediffpro.train_minimal import build_concat_file_dataloader
 from codediffpro.modeling import CodeSeqDiffuProtoModel, LabelGaussianDiffusion
+
+
+def load_tokenizer(tokenizer_path: Path) -> Tokenizer:
+    try:
+        return Tokenizer.from_file(str(tokenizer_path))
+    except Exception:
+        vocab_path = tokenizer_path.with_name("vocab.json")
+        merges_path = tokenizer_path.with_name("merges.txt")
+        tokenizer = Tokenizer(models.BPE.from_file(str(vocab_path), str(merges_path), unk_token="<unk>"))
+        tokenizer.normalizer = normalizers.Sequence([normalizers.NFKC()])
+        tokenizer.pre_tokenizer = pre_tokenizers.Whitespace()
+        tokenizer.decoder = decoders.BPEDecoder(suffix="</w>")
+        return tokenizer
 
 
 def infer_one_release(
@@ -160,7 +174,7 @@ def main() -> None:
     model_dir = Path(args.model_dir)
     cfg = json.loads((model_dir / "run_config.json").read_text(encoding="utf-8"))
 
-    tokenizer = Tokenizer.from_file(cfg["tokenizer_json"])
+    tokenizer = load_tokenizer(Path(cfg["tokenizer_json"]))
     pad_id = tokenizer.token_to_id("<pad>")
     if pad_id is None:
         pad_id = 0

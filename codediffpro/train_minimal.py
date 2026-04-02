@@ -515,8 +515,6 @@ def main() -> None:
     diffusion = LabelGaussianDiffusion(num_timesteps=args.diffusion_steps)
 
     device = torch.device(args.device)
-    model.to(device)
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     model_dir = Path("codediffpro/output/model") / args.dataset / args.exp_name
     loss_dir = Path("codediffpro/output/loss") / args.exp_name
@@ -585,14 +583,17 @@ def main() -> None:
             resume_path = model_dir / resume_path
         ckpt = torch.load(resume_path, map_location="cpu")
         model.load_state_dict(ckpt["model_state_dict"], strict=False)
-        if "optimizer_state_dict" in ckpt:
-            try:
-                optim.load_state_dict(ckpt["optimizer_state_dict"])
-            except ValueError:
-                pass
         start_epoch = int(ckpt.get("epoch", 0))
         best_tau = float(ckpt.get("best_tau", best_tau))
         resume_msg = f"[resume] checkpoint={resume_path} start_epoch={start_epoch} best_tau={best_tau:.6f}"
+
+    model.to(device)
+    optim = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.resume_checkpoint and "ckpt" in locals() and "optimizer_state_dict" in ckpt:
+        try:
+            optim.load_state_dict(ckpt["optimizer_state_dict"])
+        except ValueError:
+            pass
 
     with log_path.open("w", encoding="utf-8") as logf:
         def log(msg: str) -> None:

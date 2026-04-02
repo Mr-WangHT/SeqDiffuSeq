@@ -40,6 +40,6 @@ cd /mnt/sda/wanght19/code/SVD/DiffuModel/SeqDiffuSeq
   --tau-mode auto \
   --tau-candidates 81 \
   --seed 0 \
-  --device cpu \
+  --device cuda:1 \
   --save-all-checkpoints \
   --resume-checkpoint /mnt/sda/wanght19/code/SVD/DiffuModel/SeqDiffuSeq/codediffpro/output/model/activemq/activemq_codediffpro_rankhn_hardt_ep40_20260326/checkpoint_best.pth

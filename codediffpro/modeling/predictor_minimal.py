@@ -113,6 +113,7 @@ class CodeSeqDiffuProtoModel(nn.Module):
             nn.SiLU(),
             nn.Linear(label_emb_dim, label_emb_dim),
         )
+        self.tgt_pos_scale = nn.Parameter(torch.tensor(1.0))
 
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=label_emb_dim,
@@ -154,7 +155,8 @@ class CodeSeqDiffuProtoModel(nn.Module):
 
         t_emb = timestep_embedding(timesteps, self.label_emb_dim)
         t_emb = self.time_mlp(t_emb).unsqueeze(1)
-        x = noisy_label_emb + t_emb
+        pos_x = line_position_embedding(noisy_label_emb.size(1), self.label_emb_dim, noisy_label_emb.device).unsqueeze(0)
+        x = noisy_label_emb + t_emb + self.tgt_pos_scale * pos_x
 
         key_padding_mask = line_mask == 0
         pred_hidden = self.denoise_decoder(

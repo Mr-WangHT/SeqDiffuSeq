@@ -130,9 +130,12 @@ class LabelGaussianDiffusion:
         token_mask = batch["token_mask"]
         line_labels = batch["line_labels"]
         line_mask = batch["line_mask"].float()
+        use_mse = self.num_timesteps > 1
 
         bsz = input_ids.size(0)
         t = torch.randint(0, self.num_timesteps, (bsz,), device=input_ids.device).long()
+        if self.num_timesteps == 1:
+            t = torch.zeros((bsz,), device=input_ids.device, dtype=torch.long)
 
         x_start = model.get_label_embeddings(line_labels)
         noise = torch.randn_like(x_start)
@@ -148,6 +151,7 @@ class LabelGaussianDiffusion:
 
         mse_per_pos = ((pred_noise - noise) ** 2).mean(dim=-1)
         mse = (mse_per_pos * line_mask).sum() / line_mask.sum().clamp(min=1.0)
+        mse_term = mse if use_mse else torch.zeros_like(mse)
 
         x0_pred = self.predict_x0_from_eps(x_t=x_t, t=t, eps=pred_noise)
         prototypes = model.label_embedding.weight
@@ -248,7 +252,7 @@ class LabelGaussianDiffusion:
             consistency = (cons_per_pos * cons_mask).sum() / cons_mask.sum().clamp(min=1.0)
 
         total = (
-            mse
+            mse_term
             + float(consistency_weight) * consistency
             + float(proto_weight) * proto
             + float(ranking_weight) * ranking
@@ -257,7 +261,7 @@ class LabelGaussianDiffusion:
         )
         return DiffusionLosses(
             loss=total,
-            mse=mse,
+            mse=mse_term,
             consistency=consistency,
             proto=proto,
             ranking=ranking,
